@@ -1,13 +1,16 @@
 # WhatsApp Voice Bot (Meta Cloud API + OpenAI)
 
-這個專案提供一個可運行的 WhatsApp 語音對話 MVP：
-- 接收 WhatsApp 語音訊息（Meta Cloud API Webhook）
-- 用 OpenAI 轉錄語音成文字
-- 用 OpenAI 生成回覆
-- 用 OpenAI TTS 轉成語音
-- 回傳語音訊息到 WhatsApp
-- 支援每位用戶（chat_id）獨立語音偏好（可自行切換）
-- 支援每位用戶（chat_id）獨立主要語言偏好（降低口音誤判風險）
+這個專案提供可部署的 WhatsApp 語音助手，包含 Web Admin 後台。
+
+核心能力：
+- 收取 WhatsApp 語音訊息（Meta Cloud API Webhook）
+- OpenAI STT 轉文字、生成回覆、TTS 回語音
+- 白名單控制（只回應白名單用戶）
+- 每位用戶獨立語音偏好與語言偏好
+- 對話文字記錄（雙向）
+- 記憶功能（用戶可要求記下/讀出記憶）
+- Admin 可為指定用戶植入記憶
+- Web Admin 登入與管理
 
 ## 1. 專案結構
 
@@ -19,6 +22,8 @@ app/whatsapp.py
 app/openai_client.py
 app/voice_store.py
 app/language_store.py
+app/db.py
+app/admin_auth.py
 .env.example
 requirements.txt
 vercel.json
@@ -43,21 +48,16 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 ## 4. Meta Webhook 設定
 
-Webhook URL 例子：
-- `https://<your-domain>/webhook`
+- Callback URL: `https://<your-domain>/webhook`
+- Verify Token: `.env` 的 `WHATSAPP_VERIFY_TOKEN`
 
-Verify Token：
-- 使用 `.env` 的 `WHATSAPP_VERIFY_TOKEN`
+Meta 驗證會打：
+- `GET /webhook?hub.mode=subscribe&hub.verify_token=...&hub.challenge=...`
 
-Webhook 驗證：
-- Meta 會呼叫 `GET /webhook?hub.mode=subscribe&hub.verify_token=...&hub.challenge=...`
-
-訊息接收：
-- Meta 會呼叫 `POST /webhook`
+訊息事件會打：
+- `POST /webhook`
 
 ## 5. 本地測試
-
-可用 ngrok 暴露本地端口：
 
 ```bash
 ngrok http 8000
@@ -65,72 +65,97 @@ ngrok http 8000
 
 把 ngrok HTTPS URL 填入 Meta Webhook。
 
-## 6. 必要環境變數
+## 6. 主要環境變數
 
-- `WHATSAPP_ACCESS_TOKEN`: WhatsApp Cloud API token
-- `WHATSAPP_PHONE_NUMBER_ID`: 你的 phone number id
-- `WHATSAPP_VERIFY_TOKEN`: webhook 驗證字串
-- `WHATSAPP_APP_SECRET`: 用來驗 `x-hub-signature-256`（建議設定）
-- `OPENAI_API_KEY`: OpenAI API key
+必要：
+- `WHATSAPP_ACCESS_TOKEN`
+- `WHATSAPP_PHONE_NUMBER_ID`
+- `WHATSAPP_VERIFY_TOKEN`
+- `WHATSAPP_APP_SECRET`
+- `OPENAI_API_KEY`
 
-可調整模型：
+模型與語音：
 - `OPENAI_TRANSCRIBE_MODEL`（預設 `gpt-4o-mini-transcribe`）
 - `OPENAI_RESPONSE_MODEL`（預設 `gpt-4.1-mini`）
 - `OPENAI_TTS_MODEL`（預設 `gpt-4o-mini-tts`）
 - `OPENAI_TTS_VOICE`（預設 `alloy`）
-- `OPENAI_TTS_FORMAT`（預設 `opus`，建議保持）
-- `OPENAI_TTS_VOICES`（可切換語音白名單，逗號分隔）
+- `OPENAI_TTS_FORMAT`（預設 `opus`）
+- `OPENAI_TTS_VOICES`（可切換語音白名單）
+
+語言：
 - `OPENAI_DEFAULT_LANGUAGE`（預設 `zh-HK`）
-- `OPENAI_LANGUAGES`（可切換語言白名單，逗號分隔）
-- `VOICE_STORE_PATH`（用戶語音偏好儲存路徑）
-- `LANGUAGE_STORE_PATH`（用戶語言偏好儲存路徑）
+- `OPENAI_LANGUAGES`（可切換語言白名單）
 
-## 6.1 用戶切換聲音指令
+儲存：
+- `DB_PATH`（預設 `/tmp/wa_voice_bot.sqlite3`）
+- `VOICE_STORE_PATH`
+- `LANGUAGE_STORE_PATH`
 
-- 查看目前聲音和可用聲音：
-  - `voice`
-  - `聲音`
-- 切換聲音：
-  - `voice aria`
-  - `voice alloy`
+Admin：
+- `ADMIN_SESSION_SECRET`
+- `ADMIN_SESSION_HOURS`
+- `ADMIN_BOOTSTRAP_EMAIL`（首次建立 admin 用）
+- `ADMIN_BOOTSTRAP_PASSWORD`（首次建立 admin 用）
 
-收到語音訊息時，bot 會使用該用戶最後設定的聲音回覆。
+## 7. 用戶指令
 
-## 6.2 用戶切換主要語言指令
+### 7.1 聲音切換
+- 查看：`voice` / `聲音`
+- 切換：`voice aria`
 
-- 查看目前語言和可用語言：
-  - `language`
-  - `lang`
-  - `語言`
-- 切換語言（可用代碼或別名）：
-  - `language zh-HK`
-  - `language en`
-  - `語言 英文`
-  - `語言 廣東話`
+### 7.2 語言切換
+- 查看：`language` / `lang` / `語言`
+- 切換：`language zh-HK` / `language en` / `語言 廣東話`
 
-收到語音訊息時，bot 會：
-- 以該用戶主要語言提示 STT（減少轉錄語言誤判）
-- 強制以該用戶主要語言回覆
+### 7.3 記憶功能
+- 記下：`記低 明天早上10點同客開會`
+- 記下：`remember that client A likes Wednesday morning`
+- 讀出：`記憶` / `紀錄` / `memory`
 
-## 7. API 路由
+## 8. Web Admin 後台
 
-- `GET /`: service info
-- `GET /healthz`: 檢查 WhatsApp / OpenAI 連線
-- `GET /webhook`: Meta webhook verify
-- `POST /webhook`: 處理入站 WhatsApp 訊息
+- 頁面：`GET /admin`
 
-## 8. 部署到 Vercel（可選）
+登入後可管理：
+- 白名單（新增/刪除可回應用戶）
+- 用戶清單
+- 每位用戶對話文字記錄
+- 每位用戶記憶（新增/封存）
+- Admin 帳戶（新增/更新）
 
-這個 repo 已附 `vercel.json`。
+首次 admin 建議流程：
+1. 設定 `ADMIN_SESSION_SECRET`
+2. 設定 `ADMIN_BOOTSTRAP_EMAIL` + `ADMIN_BOOTSTRAP_PASSWORD`
+3. 重啟服務後登入 `/admin`
+4. 建立正式 admin 後可移除 bootstrap 變數
 
-步驟：
+## 9. API 路由
+
+- `GET /`
+- `GET /healthz`
+- `GET /privacy`
+- `GET /data-deletion`
+- `GET /webhook`
+- `POST /webhook`
+- `GET /admin`
+- `POST /admin/auth/login`
+- `POST /admin/auth/logout`
+- `GET /admin/auth/me`
+- `GET /admin/api/users`
+- `GET/POST/DELETE /admin/api/whitelist`
+- `GET /admin/api/conversations`
+- `GET/POST/DELETE /admin/api/memories`
+- `GET/POST /admin/api/admin-users`
+
+## 10. 部署到 Vercel
+
 1. Push 到 GitHub
-2. Vercel 匯入 repo
-3. 設定所有環境變數
+2. 在 Vercel 匯入 repo
+3. 設定上述環境變數
 4. 部署後把 `https://<vercel-domain>/webhook` 填回 Meta
 
-## 9. 注意事項
+## 11. 注意事項
 
-- 文字訊息只處理 `voice` / `language` 指令，其他文字會忽略
-- 單請求串行處理語音；高流量建議改成 queue / worker
-- 請確認你的 WhatsApp Cloud API 帳號已開啟對應權限
+- 非白名單用戶訊息會被忽略（不回應）
+- 文字訊息目前主要處理 `voice` / `language` / `memory` 類指令
+- 預設使用 SQLite；Vercel serverless 的 `/tmp` 屬短暫儲存，建議之後改外部 DB（例如 Supabase）

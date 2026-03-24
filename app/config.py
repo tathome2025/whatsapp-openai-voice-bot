@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     )
     voice_store_path: str = "/tmp/voice_preferences.json"
     language_store_path: str = "/tmp/language_preferences.json"
+    db_path: str = "/tmp/wa_voice_bot.sqlite3"
+    admin_session_secret: str = ""
+    admin_session_hours: int = 12
+    admin_bootstrap_email: str = ""
+    admin_bootstrap_password: str = ""
 
     max_reply_chars: int = 800
 
@@ -39,6 +44,13 @@ class Settings(BaseSettings):
         if value in (None, ""):
             return 800
         return max(80, int(value))
+
+    @field_validator("admin_session_hours", mode="before")
+    @classmethod
+    def normalize_admin_session_hours(cls, value: object) -> int:
+        if value in (None, ""):
+            return 12
+        return max(1, int(value))
 
 
 @lru_cache(maxsize=1)

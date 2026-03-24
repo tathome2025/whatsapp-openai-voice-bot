@@ -44,10 +44,22 @@ class OpenAIClient:
             raise RuntimeError(f"OpenAI transcription returned empty text: {payload}")
         return text
 
-    async def generate_reply_text(self, user_text: str, *, reply_language_instruction: str | None = None) -> str:
+    async def generate_reply_text(
+        self,
+        user_text: str,
+        *,
+        reply_language_instruction: str | None = None,
+        memory_context: str | None = None,
+    ) -> str:
         system_prompt = self.settings.openai_system_prompt
         if reply_language_instruction:
             system_prompt = f"{system_prompt}\n\n{reply_language_instruction}"
+        if memory_context:
+            system_prompt = (
+                f"{system_prompt}\n\n"
+                "Below are user memories. Use them as factual context when relevant.\n"
+                f"{memory_context}"
+            )
 
         payload = {
             "model": self.settings.openai_response_model,
