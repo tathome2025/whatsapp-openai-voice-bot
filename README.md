@@ -6,6 +6,7 @@
 - 用 OpenAI 生成回覆
 - 用 OpenAI TTS 轉成語音
 - 回傳語音訊息到 WhatsApp
+- 支援每位用戶（chat_id）獨立語音偏好（可自行切換）
 
 ## 1. 專案結構
 
@@ -75,6 +76,19 @@ ngrok http 8000
 - `OPENAI_TTS_MODEL`（預設 `gpt-4o-mini-tts`）
 - `OPENAI_TTS_VOICE`（預設 `alloy`）
 - `OPENAI_TTS_FORMAT`（預設 `opus`，建議保持）
+- `OPENAI_TTS_VOICES`（可切換語音白名單，逗號分隔）
+- `VOICE_STORE_PATH`（用戶語音偏好儲存路徑）
+
+## 6.1 用戶切換聲音指令
+
+- 查看目前聲音和可用聲音：
+  - `voice`
+  - `聲音`
+- 切換聲音：
+  - `voice aria`
+  - `voice alloy`
+
+收到語音訊息時，bot 會使用該用戶最後設定的聲音回覆。
 
 ## 7. API 路由
 

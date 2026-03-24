@@ -72,11 +72,12 @@ class OpenAIClient:
 
         return text[: self.settings.max_reply_chars]
 
-    async def synthesize_speech(self, text: str) -> tuple[bytes, str, str]:
+    async def synthesize_speech(self, text: str, *, voice: str | None = None) -> tuple[bytes, str, str]:
         response_format = (self.settings.openai_tts_format or "opus").strip().lower()
+        selected_voice = (voice or self.settings.openai_tts_voice).strip()
         payload = {
             "model": self.settings.openai_tts_model,
-            "voice": self.settings.openai_tts_voice,
+            "voice": selected_voice,
             "input": text,
             "response_format": response_format,
         }

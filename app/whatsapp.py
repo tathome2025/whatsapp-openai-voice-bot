@@ -104,31 +104,51 @@ class WhatsAppClient:
         return {"ok": True}
 
 
-def extract_audio_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
+def extract_inbound_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
     items: list[dict[str, str]] = []
 
     for entry in payload.get("entry", []):
         for change in entry.get("changes", []):
             value = change.get("value", {})
             for message in value.get("messages", []):
-                if message.get("type") != "audio":
-                    continue
-
-                media = message.get("audio") or {}
-                media_id = str(media.get("id") or "").strip()
                 chat_id = str(message.get("from") or "").strip()
                 message_id = str(message.get("id") or "").strip()
+                msg_type = str(message.get("type") or "").strip().lower()
 
-                if not media_id or not chat_id:
+                if not chat_id:
                     continue
 
-                items.append(
-                    {
-                        "chat_id": chat_id,
-                        "message_id": message_id,
-                        "media_id": media_id,
-                        "mime_type": str(media.get("mime_type") or "audio/ogg"),
-                    }
-                )
+                if msg_type == "audio":
+                    media = message.get("audio") or {}
+                    media_id = str(media.get("id") or "").strip()
+                    if not media_id:
+                        continue
+                    items.append(
+                        {
+                            "type": "audio",
+                            "chat_id": chat_id,
+                            "message_id": message_id,
+                            "media_id": media_id,
+                            "mime_type": str(media.get("mime_type") or "audio/ogg"),
+                        }
+                    )
+                    continue
+
+                if msg_type == "text":
+                    text = str((message.get("text") or {}).get("body") or "").strip()
+                    if not text:
+                        continue
+                    items.append(
+                        {
+                            "type": "text",
+                            "chat_id": chat_id,
+                            "message_id": message_id,
+                            "text": text,
+                        }
+                    )
 
     return items
+
+
+def extract_audio_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
+    return [item for item in extract_inbound_messages(payload) if item.get("type") == "audio"]

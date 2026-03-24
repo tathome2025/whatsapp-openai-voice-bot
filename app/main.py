@@ -5,6 +5,7 @@ import hmac
 import json
 import logging
 import os
+import re
 from html import escape
 from typing import Any
 
@@ -13,7 +14,8 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 
 from app.config import get_settings
 from app.openai_client import OpenAIClient
-from app.whatsapp import WhatsAppClient, extract_audio_messages
+from app.voice_store import VoicePreferenceStore
+from app.whatsapp import WhatsAppClient, extract_inbound_messages
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,6 +23,7 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 whatsapp = WhatsAppClient(settings)
 openai = OpenAIClient(settings)
+voice_store = VoicePreferenceStore(settings)
 
 app = FastAPI(title="WhatsApp OpenAI Voice Bot", version="0.1.0")
 
@@ -102,6 +105,10 @@ async def healthz() -> dict[str, Any]:
         "status": "ok",
         "whatsapp": await whatsapp.health_check(),
         "openai": await openai.health_check(),
+        "voice": {
+            "default_voice": settings.openai_tts_voice,
+            "available_voices": _allowed_voices(),
+        },
     }
 
 
@@ -130,28 +137,42 @@ async def receive_webhook(request: Request) -> dict[str, int | str]:
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=400, detail="Invalid JSON") from exc
 
-    audio_messages = extract_audio_messages(payload)
-    if not audio_messages:
+    inbound_messages = extract_inbound_messages(payload)
+    if not inbound_messages:
         return {"status": "ok", "processed": 0, "ignored": 1, "failed": 0}
 
     processed = 0
+    ignored = 0
     failed = 0
 
-    for item in audio_messages:
+    for item in inbound_messages:
         try:
-            await _handle_audio_message(item)
-            processed += 1
+            msg_type = item.get("type")
+            if msg_type == "audio":
+                await _handle_audio_message(item)
+                processed += 1
+                continue
+
+            if msg_type == "text":
+                handled = await _handle_text_message(item)
+                if handled:
+                    processed += 1
+                else:
+                    ignored += 1
+                continue
+
+            ignored += 1
         except Exception as exc:  # noqa: BLE001
             failed += 1
             chat_id = item.get("chat_id", "")
-            logger.exception("Failed to process audio for chat=%s: %s", chat_id, exc)
+            logger.exception("Failed to process message type=%s chat=%s: %s", item.get("type"), chat_id, exc)
             if chat_id:
                 await _safe_send_error(chat_id)
 
     return {
         "status": "ok",
         "processed": processed,
-        "ignored": 0,
+        "ignored": ignored,
         "failed": failed,
     }
 
@@ -177,7 +198,8 @@ async def _handle_audio_message(item: dict[str, str]) -> None:
     logger.info("Transcribed from %s: %s", chat_id, transcript)
 
     reply_text = await openai.generate_reply_text(transcript)
-    tts_bytes, tts_filename, tts_mime = await openai.synthesize_speech(reply_text)
+    selected_voice = await voice_store.get_voice(chat_id)
+    tts_bytes, tts_filename, tts_mime = await openai.synthesize_speech(reply_text, voice=selected_voice)
 
     uploaded_media_id = await whatsapp.upload_media(
         data=tts_bytes,
@@ -197,6 +219,39 @@ async def _safe_send_error(chat_id: str) -> None:
         logger.exception("Failed to send fallback error text")
 
 
+async def _handle_text_message(item: dict[str, str]) -> bool:
+    chat_id = item["chat_id"]
+    text = item.get("text", "").strip()
+    command = _parse_voice_command(text)
+    if command is None:
+        return False
+
+    allowed = _allowed_voices()
+
+    if command["action"] == "show":
+        current = await voice_store.get_voice(chat_id)
+        body = (
+            f"目前語音: {current}\n"
+            f"可用語音: {', '.join(allowed)}\n"
+            "切換方法: voice <聲音名>\n"
+            "例子: voice aria"
+        )
+        await whatsapp.send_text_message(chat_id, body)
+        return True
+
+    target_voice = str(command.get("voice") or "").lower()
+    if target_voice not in allowed:
+        await whatsapp.send_text_message(
+            chat_id,
+            f"未支援語音「{target_voice}」。可用: {', '.join(allowed)}",
+        )
+        return True
+
+    await voice_store.set_voice(chat_id, target_voice)
+    await whatsapp.send_text_message(chat_id, f"已切換語音到 {target_voice}。")
+    return True
+
+
 def _verify_signature(raw_body: bytes, signature_header: str | None) -> bool:
     if not settings.whatsapp_app_secret:
         return True
@@ -212,6 +267,46 @@ def _verify_signature(raw_body: bytes, signature_header: str | None) -> bool:
     provided = signature_header.split("=", 1)[1]
 
     return hmac.compare_digest(expected, provided)
+
+
+def _allowed_voices() -> list[str]:
+    raw = (settings.openai_tts_voices or "").strip()
+    if not raw:
+        return [settings.openai_tts_voice.lower()]
+
+    voices = [v.strip().lower() for v in raw.split(",") if v.strip()]
+    if not voices:
+        return [settings.openai_tts_voice.lower()]
+    if settings.openai_tts_voice.lower() not in voices:
+        voices.append(settings.openai_tts_voice.lower())
+    return voices
+
+
+def _parse_voice_command(text: str) -> dict[str, str] | None:
+    raw = text.strip()
+    normalized = raw.lower()
+    if normalized in {
+        "voice",
+        "voices",
+        "voice list",
+        "聲音",
+        "語音",
+        "语音",
+        "聲音列表",
+        "語音列表",
+        "语音列表",
+    }:
+        return {"action": "show"}
+
+    match = re.fullmatch(
+        r"(?:voice|set\s+voice|聲音|語音|语音)\s*(?::|=|\s)\s*([a-zA-Z0-9_-]+)\s*",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+
+    return {"action": "set", "voice": match.group(1).lower()}
 
 
 def _render_legal_page(title: str, body_html: str) -> str:
