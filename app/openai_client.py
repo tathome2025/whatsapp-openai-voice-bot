@@ -73,11 +73,12 @@ class OpenAIClient:
         return text[: self.settings.max_reply_chars]
 
     async def synthesize_speech(self, text: str) -> tuple[bytes, str, str]:
+        response_format = (self.settings.openai_tts_format or "opus").strip().lower()
         payload = {
             "model": self.settings.openai_tts_model,
             "voice": self.settings.openai_tts_voice,
             "input": text,
-            "response_format": "ogg",
+            "response_format": response_format,
         }
         headers = {**self._headers, "Content-Type": "application/json"}
 
@@ -89,8 +90,8 @@ class OpenAIClient:
             )
         resp.raise_for_status()
 
-        mime_type = resp.headers.get("content-type", "audio/ogg")
-        return resp.content, "reply.ogg", mime_type
+        mime_type = resp.headers.get("content-type", f"audio/{response_format}")
+        return resp.content, f"reply.{response_format}", mime_type
 
     async def health_check(self) -> dict[str, Any]:
         if not self.settings.openai_api_key:

@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     openai_response_model: str = "gpt-4.1-mini"
     openai_tts_model: str = "gpt-4o-mini-tts"
     openai_tts_voice: str = "alloy"
+    openai_tts_format: str = "opus"
     openai_system_prompt: str = (
         "You are a concise and helpful WhatsApp voice assistant. "
         "Reply in Traditional Chinese unless the user explicitly uses another language."

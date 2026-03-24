@@ -74,6 +74,7 @@ ngrok http 8000
 - `OPENAI_RESPONSE_MODEL`（預設 `gpt-4.1-mini`）
 - `OPENAI_TTS_MODEL`（預設 `gpt-4o-mini-tts`）
 - `OPENAI_TTS_VOICE`（預設 `alloy`）
+- `OPENAI_TTS_FORMAT`（預設 `opus`，建議保持）
 
 ## 7. API 路由
 
