@@ -4,10 +4,12 @@ import hashlib
 import hmac
 import json
 import logging
+import os
+from html import escape
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 
 from app.config import get_settings
 from app.openai_client import OpenAIClient
@@ -26,6 +28,72 @@ app = FastAPI(title="WhatsApp OpenAI Voice Bot", version="0.1.0")
 @app.get("/")
 async def root() -> dict[str, str]:
     return {"status": "ok", "service": "whatsapp-openai-voice-bot"}
+
+
+@app.get("/privacy", response_class=HTMLResponse)
+async def privacy_policy() -> str:
+    contact_email = escape(os.getenv("PRIVACY_CONTACT_EMAIL", "support@example.com"))
+    content = f"""
+    <h2>1. Data We Collect</h2>
+    <ul>
+      <li>WhatsApp phone number and message metadata</li>
+      <li>Message content you send to the bot (including voice transcripts)</li>
+      <li>Operational logs required for reliability and security</li>
+    </ul>
+
+    <h2>2. Why We Use Data</h2>
+    <ul>
+      <li>Provide voice assistant replies over WhatsApp</li>
+      <li>Improve service quality and troubleshooting</li>
+      <li>Prevent abuse and unauthorized access</li>
+    </ul>
+
+    <h2>3. Processors</h2>
+    <ul>
+      <li>Meta WhatsApp Cloud API (message transport)</li>
+      <li>OpenAI API (speech recognition, response generation, text-to-speech)</li>
+      <li>Vercel (hosting and runtime logs)</li>
+    </ul>
+
+    <h2>4. Data Retention</h2>
+    <p>We retain data only as long as necessary to provide and secure the service, unless longer retention is required by law.</p>
+
+    <h2>5. Data Deletion</h2>
+    <p>You can request deletion anytime. See <a href="/data-deletion">Data Deletion Instructions</a>.</p>
+
+    <h2>6. Contact</h2>
+    <p>Privacy inquiries: <a href="mailto:{contact_email}">{contact_email}</a></p>
+
+    <h2>7. Effective Date</h2>
+    <p>2026-03-24</p>
+    """
+    return _render_legal_page("Privacy Policy", content)
+
+
+@app.get("/data-deletion", response_class=HTMLResponse)
+async def data_deletion() -> str:
+    contact_email = escape(os.getenv("PRIVACY_CONTACT_EMAIL", "support@example.com"))
+    content = f"""
+    <h2>How to Request Deletion</h2>
+    <ol>
+      <li>Send us your WhatsApp number and deletion request via email to <a href="mailto:{contact_email}">{contact_email}</a>, or</li>
+      <li>Message the bot with: <code>delete my data</code></li>
+    </ol>
+
+    <h2>What Will Be Deleted</h2>
+    <ul>
+      <li>Stored user messages and transcripts associated with your number</li>
+      <li>Assistant response records linked to your number</li>
+      <li>Related processing metadata where applicable</li>
+    </ul>
+
+    <h2>Timeline</h2>
+    <p>Deletion requests are generally completed within 7 business days.</p>
+
+    <h2>Effective Date</h2>
+    <p>2026-03-24</p>
+    """
+    return _render_legal_page("Data Deletion Instructions", content)
 
 
 @app.get("/healthz")
@@ -144,3 +212,54 @@ def _verify_signature(raw_body: bytes, signature_header: str | None) -> bool:
     provided = signature_header.split("=", 1)[1]
 
     return hmac.compare_digest(expected, provided)
+
+
+def _render_legal_page(title: str, body_html: str) -> str:
+    safe_title = escape(title)
+    return f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{safe_title}</title>
+    <style>
+      body {{
+        margin: 0;
+        background: #f5f5f5;
+        color: #1f2937;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+      }}
+      .shell {{
+        max-width: 840px;
+        margin: 32px auto;
+        background: #fff;
+        border: 1px solid #e5e7eb;
+        border-radius: 12px;
+        padding: 28px;
+        line-height: 1.6;
+      }}
+      h1 {{
+        margin: 0 0 16px;
+        color: #111827;
+      }}
+      h2 {{
+        margin: 20px 0 8px;
+        color: #111827;
+      }}
+      code {{
+        background: #f3f4f6;
+        padding: 1px 6px;
+        border-radius: 6px;
+      }}
+      a {{
+        color: #2563eb;
+      }}
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <h1>{safe_title}</h1>
+      {body_html}
+    </main>
+  </body>
+</html>"""
