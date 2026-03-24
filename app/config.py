@@ -13,6 +13,9 @@ class Settings(BaseSettings):
     whatsapp_app_secret: str = ""
     whatsapp_graph_version: str = "v23.0"
 
+    supabase_url: str = ""
+    supabase_service_role_key: str = ""
+
     openai_api_key: str = ""
     openai_transcribe_model: str = "gpt-4o-mini-transcribe"
     openai_response_model: str = "gpt-4.1-mini"
@@ -26,9 +29,6 @@ class Settings(BaseSettings):
         "You are a concise and helpful WhatsApp voice assistant. "
         "Reply in Traditional Chinese unless the user explicitly uses another language."
     )
-    voice_store_path: str = "/tmp/voice_preferences.json"
-    language_store_path: str = "/tmp/language_preferences.json"
-    db_path: str = "/tmp/wa_voice_bot.sqlite3"
     admin_session_secret: str = ""
     admin_session_hours: int = 12
     admin_bootstrap_email: str = ""
@@ -51,6 +51,10 @@ class Settings(BaseSettings):
         if value in (None, ""):
             return 12
         return max(1, int(value))
+
+    @property
+    def supabase_rest_url(self) -> str:
+        return f"{self.supabase_url.rstrip('/')}/rest/v1" if self.supabase_url else ""
 
 
 @lru_cache(maxsize=1)

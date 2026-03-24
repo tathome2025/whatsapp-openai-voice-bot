@@ -16,9 +16,7 @@ from pydantic import BaseModel
 from app.admin_auth import hash_password, make_session_token, parse_session_token, verify_password
 from app.config import get_settings
 from app.db import AppRepo
-from app.language_store import LanguagePreferenceStore
 from app.openai_client import OpenAIClient
-from app.voice_store import VoicePreferenceStore
 from app.whatsapp import WhatsAppClient, extract_inbound_messages
 
 logging.basicConfig(level=logging.INFO)
@@ -28,8 +26,6 @@ settings = get_settings()
 repo = AppRepo(settings)
 whatsapp = WhatsAppClient(settings)
 openai = OpenAIClient(settings)
-voice_store = VoicePreferenceStore(settings)
-language_store = LanguagePreferenceStore(settings)
 
 app = FastAPI(title="WhatsApp OpenAI Voice Bot", version="0.2.0")
 
@@ -59,22 +55,28 @@ class AdminUserCreate(BaseModel):
 
 
 def _bootstrap_admin_if_needed() -> None:
+    if not repo.is_ready:
+        return
+
     email = settings.admin_bootstrap_email.strip().lower()
     password = settings.admin_bootstrap_password
     if not email or not password:
         return
 
-    if repo.count_admin_users() > 0:
-        return
+    try:
+        if repo.count_admin_users() > 0:
+            return
 
-    password_hash = hash_password(password)
-    repo.upsert_admin_user(
-        email=email,
-        display_name="Bootstrap Admin",
-        password_hash=password_hash,
-        status="active",
-    )
-    logger.info("Bootstrap admin account created: %s", email)
+        password_hash = hash_password(password)
+        repo.upsert_admin_user(
+            email=email,
+            display_name="Bootstrap Admin",
+            password_hash=password_hash,
+            status="active",
+        )
+        logger.info("Bootstrap admin account created: %s", email)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Bootstrap admin skipped: %s", exc)
 
 
 _bootstrap_admin_if_needed()
@@ -156,6 +158,7 @@ async def data_deletion() -> str:
 async def healthz() -> dict[str, Any]:
     return {
         "status": "ok",
+        "supabase": repo.health_check(),
         "whatsapp": await whatsapp.health_check(),
         "openai": await openai.health_check(),
         "voice": {
@@ -180,6 +183,8 @@ async def admin_page() -> str:
 
 @app.get("/admin/auth/me")
 async def admin_me(request: Request) -> dict[str, Any]:
+    if not repo.is_ready:
+        return {"authenticated": False}
     user = await _get_admin_user_from_request(request)
     if not user:
         return {"authenticated": False}
@@ -195,6 +200,7 @@ async def admin_me(request: Request) -> dict[str, Any]:
 
 @app.post("/admin/auth/login")
 async def admin_login(request: Request, body: AdminLoginRequest, response: Response) -> dict[str, Any]:
+    _assert_repo_ready()
     if not settings.admin_session_secret:
         raise HTTPException(status_code=503, detail="ADMIN_SESSION_SECRET is not configured")
 
@@ -363,6 +369,7 @@ async def verify_webhook(request: Request) -> str:
 
 @app.post("/webhook")
 async def receive_webhook(request: Request) -> dict[str, int | str]:
+    _assert_repo_ready()
     raw_body = await request.body()
     signature = request.headers.get("x-hub-signature-256")
 
@@ -433,7 +440,7 @@ async def _handle_audio_message(item: dict[str, str]) -> None:
 
     audio_bytes, downloaded_mime = await whatsapp.download_media_bytes(download_url)
     input_mime = downloaded_mime or inbound_mime
-    selected_language = await language_store.get_language(chat_id)
+    selected_language = repo.get_user_language(chat_id, default_language=settings.openai_default_language)
     transcribe_language = _transcribe_language_code(selected_language)
 
     transcript = await openai.transcribe_audio(
@@ -472,7 +479,7 @@ async def _handle_audio_message(item: dict[str, str]) -> None:
         message_text=reply_text,
     )
 
-    selected_voice = await voice_store.get_voice(chat_id)
+    selected_voice = repo.get_user_voice(chat_id, default_voice=settings.openai_tts_voice)
     tts_bytes, tts_filename, tts_mime = await openai.synthesize_speech(reply_text, voice=selected_voice)
 
     uploaded_media_id = await whatsapp.upload_media(
@@ -522,7 +529,7 @@ async def _handle_text_message(item: dict[str, str]) -> bool:
 async def _handle_voice_command(chat_id: str, command: dict[str, str]) -> str:
     allowed = _allowed_voices()
     if command["action"] == "show":
-        current = await voice_store.get_voice(chat_id)
+        current = repo.get_user_voice(chat_id, default_voice=settings.openai_tts_voice)
         body = (
             f"目前語音: {current}\n"
             f"可用語音: {', '.join(allowed)}\n"
@@ -538,7 +545,7 @@ async def _handle_voice_command(chat_id: str, command: dict[str, str]) -> str:
         await whatsapp.send_text_message(chat_id, body)
         return body
 
-    await voice_store.set_voice(chat_id, target_voice)
+    repo.set_user_voice(chat_id, target_voice)
     body = f"已切換語音到 {target_voice}。"
     await whatsapp.send_text_message(chat_id, body)
     return body
@@ -547,7 +554,7 @@ async def _handle_voice_command(chat_id: str, command: dict[str, str]) -> str:
 async def _handle_language_command(chat_id: str, command: dict[str, str]) -> str:
     allowed = _allowed_languages()
     if command["action"] == "show":
-        current = await language_store.get_language(chat_id)
+        current = repo.get_user_language(chat_id, default_language=settings.openai_default_language)
         body = (
             f"目前主要語言: {current}\n"
             f"可用語言: {', '.join(allowed)}\n"
@@ -563,7 +570,7 @@ async def _handle_language_command(chat_id: str, command: dict[str, str]) -> str
         await whatsapp.send_text_message(chat_id, body)
         return body
 
-    await language_store.set_language(chat_id, target_language)
+    repo.set_user_language(chat_id, target_language)
     body = f"已設定主要語言為 {target_language}。"
     await whatsapp.send_text_message(chat_id, body)
     return body
@@ -816,7 +823,14 @@ def _normalize_chat_id(value: str) -> str:
     return value.strip()
 
 
+def _assert_repo_ready() -> None:
+    if repo.is_ready:
+        return
+    raise HTTPException(status_code=503, detail="Supabase is not configured")
+
+
 async def _assert_admin_auth(request: Request) -> dict[str, Any]:
+    _assert_repo_ready()
     user = await _get_admin_user_from_request(request)
     if not user:
         raise HTTPException(status_code=401, detail="Unauthorized admin session")

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import sqlite3
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
+
+import httpx
 
 from app.config import Settings
 
@@ -11,267 +11,353 @@ from app.config import Settings
 class AppRepo:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.db_path = Path(settings.db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_schema()
+        self.base_url = settings.supabase_rest_url
+        self.service_role_key = settings.supabase_service_role_key.strip()
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path), timeout=30)
-        conn.row_factory = sqlite3.Row
-        return conn
+    @property
+    def is_ready(self) -> bool:
+        return bool(self.base_url and self.service_role_key)
 
-    def _init_schema(self) -> None:
-        with self._connect() as conn:
-            conn.executescript(
-                """
-                PRAGMA journal_mode=WAL;
+    def health_check(self) -> dict[str, Any]:
+        if not self.is_ready:
+            return {"ok": False, "error": "SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is missing"}
 
-                CREATE TABLE IF NOT EXISTS admin_users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    email TEXT NOT NULL UNIQUE,
-                    display_name TEXT NOT NULL DEFAULT '',
-                    password_hash TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'active',
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    last_login_at TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS whitelist_contacts (
-                    chat_id TEXT PRIMARY KEY,
-                    label TEXT NOT NULL DEFAULT '',
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS conversation_logs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    chat_id TEXT NOT NULL,
-                    direction TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    source_type TEXT NOT NULL,
-                    message_text TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_conversation_chat_created
-                ON conversation_logs (chat_id, created_at DESC, id DESC);
-
-                CREATE TABLE IF NOT EXISTS user_memories (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    chat_id TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    created_by TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'active',
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_memories_chat_status
-                ON user_memories (chat_id, status, created_at DESC, id DESC);
-                """
-            )
+        try:
+            _ = self.count_admin_users()
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True}
 
     @staticmethod
     def _now_iso() -> str:
         return datetime.now(timezone.utc).isoformat()
 
+    def _headers(self, *, prefer: str | None = None) -> dict[str, str]:
+        headers = {
+            "apikey": self.service_role_key,
+            "Authorization": f"Bearer {self.service_role_key}",
+            "Content-Type": "application/json",
+        }
+        if prefer:
+            headers["Prefer"] = prefer
+        return headers
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        payload: Any | None = None,
+        prefer: str | None = None,
+        timeout: float = 30.0,
+    ) -> httpx.Response:
+        if not self.is_ready:
+            raise RuntimeError("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is not configured")
+
+        url = f"{self.base_url}{path}"
+        with httpx.Client(timeout=timeout) as client:
+            resp = client.request(
+                method=method,
+                url=url,
+                headers=self._headers(prefer=prefer),
+                params=params,
+                json=payload,
+            )
+
+        if resp.status_code >= 400:
+            text = resp.text.strip()
+            raise RuntimeError(f"Supabase request failed ({resp.status_code}) {path}: {text}")
+        return resp
+
+    @staticmethod
+    def _json_list(resp: httpx.Response) -> list[dict[str, Any]]:
+        data = resp.json()
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        if isinstance(data, dict):
+            return [data]
+        return []
+
+    @staticmethod
+    def _first_or_none(items: list[dict[str, Any]]) -> dict[str, Any] | None:
+        return items[0] if items else None
+
     def is_whitelisted(self, chat_id: str) -> bool:
-        with self._connect() as conn:
-            row = conn.execute("SELECT 1 FROM whitelist_contacts WHERE chat_id = ?", (chat_id,)).fetchone()
-            return row is not None
+        resp = self._request(
+            "GET",
+            "/whitelist_contacts",
+            params={"select": "chat_id", "chat_id": f"eq.{chat_id}", "limit": 1},
+        )
+        return len(self._json_list(resp)) > 0
 
     def list_whitelist(self) -> list[dict[str, Any]]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT chat_id, label, created_at, updated_at FROM whitelist_contacts ORDER BY updated_at DESC, chat_id"
-            ).fetchall()
-        return [dict(row) for row in rows]
+        resp = self._request(
+            "GET",
+            "/whitelist_contacts",
+            params={
+                "select": "chat_id,label,created_at,updated_at",
+                "order": "updated_at.desc,chat_id.asc",
+            },
+        )
+        return self._json_list(resp)
 
     def upsert_whitelist(self, chat_id: str, label: str = "") -> dict[str, Any]:
-        now = self._now_iso()
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO whitelist_contacts (chat_id, label, created_at, updated_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(chat_id) DO UPDATE SET
-                    label = excluded.label,
-                    updated_at = excluded.updated_at
-                """,
-                (chat_id, label, now, now),
-            )
-            row = conn.execute(
-                "SELECT chat_id, label, created_at, updated_at FROM whitelist_contacts WHERE chat_id = ?",
-                (chat_id,),
-            ).fetchone()
-        return dict(row) if row else {}
+        body = [{"chat_id": chat_id, "label": label}]
+        resp = self._request(
+            "POST",
+            "/whitelist_contacts",
+            params={"on_conflict": "chat_id"},
+            payload=body,
+            prefer="resolution=merge-duplicates,return=representation",
+        )
+        items = self._json_list(resp)
+        return self._first_or_none(items) or {}
 
     def remove_whitelist(self, chat_id: str) -> bool:
-        with self._connect() as conn:
-            cur = conn.execute("DELETE FROM whitelist_contacts WHERE chat_id = ?", (chat_id,))
-        return cur.rowcount > 0
+        resp = self._request(
+            "DELETE",
+            "/whitelist_contacts",
+            params={"chat_id": f"eq.{chat_id}"},
+            prefer="return=representation",
+        )
+        return len(self._json_list(resp)) > 0
 
     def log_message(self, chat_id: str, *, direction: str, role: str, source_type: str, message_text: str) -> None:
-        now = self._now_iso()
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO conversation_logs (chat_id, direction, role, source_type, message_text, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (chat_id, direction, role, source_type, message_text, now),
-            )
+        body = {
+            "chat_id": chat_id,
+            "direction": direction,
+            "role": role,
+            "source_type": source_type,
+            "message_text": message_text,
+        }
+        self._request("POST", "/conversation_logs", payload=body, prefer="return=minimal")
 
     def list_conversation_logs(self, chat_id: str, limit: int = 200) -> list[dict[str, Any]]:
         safe_limit = max(1, min(int(limit), 1000))
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT id, chat_id, direction, role, source_type, message_text, created_at
-                FROM conversation_logs
-                WHERE chat_id = ?
-                ORDER BY id DESC
-                LIMIT ?
-                """,
-                (chat_id, safe_limit),
-            ).fetchall()
-        return [dict(row) for row in rows]
+        resp = self._request(
+            "GET",
+            "/conversation_logs",
+            params={
+                "select": "id,chat_id,direction,role,source_type,message_text,created_at",
+                "chat_id": f"eq.{chat_id}",
+                "order": "id.desc",
+                "limit": safe_limit,
+            },
+        )
+        return self._json_list(resp)
 
     def list_known_users(self) -> list[dict[str, Any]]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                WITH users AS (
-                    SELECT chat_id FROM whitelist_contacts
-                    UNION
-                    SELECT chat_id FROM conversation_logs
-                    UNION
-                    SELECT chat_id FROM user_memories
-                )
-                SELECT
-                    u.chat_id AS chat_id,
-                    COALESCE(w.label, '') AS label,
-                    (
-                        SELECT message_text FROM conversation_logs c
-                        WHERE c.chat_id = u.chat_id
-                        ORDER BY c.id DESC LIMIT 1
-                    ) AS last_message,
-                    (
-                        SELECT created_at FROM conversation_logs c
-                        WHERE c.chat_id = u.chat_id
-                        ORDER BY c.id DESC LIMIT 1
-                    ) AS last_message_at,
-                    EXISTS(SELECT 1 FROM whitelist_contacts wx WHERE wx.chat_id = u.chat_id) AS whitelisted
-                FROM users u
-                LEFT JOIN whitelist_contacts w ON w.chat_id = u.chat_id
-                ORDER BY COALESCE(last_message_at, '') DESC, u.chat_id
-                """
-            ).fetchall()
-        return [dict(row) for row in rows]
+        try:
+            resp = self._request("POST", "/rpc/list_known_users", payload={})
+            return self._json_list(resp)
+        except Exception:  # noqa: BLE001
+            return self._list_known_users_fallback()
+
+    def _list_known_users_fallback(self) -> list[dict[str, Any]]:
+        whitelist = self.list_whitelist()
+        whitelist_by_chat = {str(item.get("chat_id") or ""): item for item in whitelist}
+
+        logs_resp = self._request(
+            "GET",
+            "/conversation_logs",
+            params={
+                "select": "chat_id,message_text,created_at,id",
+                "order": "id.desc",
+                "limit": 5000,
+            },
+        )
+        logs = self._json_list(logs_resp)
+
+        latest_by_chat: dict[str, dict[str, Any]] = {}
+        for row in logs:
+            chat = str(row.get("chat_id") or "")
+            if not chat or chat in latest_by_chat:
+                continue
+            latest_by_chat[chat] = row
+
+        mem_resp = self._request(
+            "GET",
+            "/user_memories",
+            params={"select": "chat_id", "limit": 5000},
+        )
+        memory_rows = self._json_list(mem_resp)
+
+        chats: set[str] = set(whitelist_by_chat.keys())
+        chats.update(latest_by_chat.keys())
+        for row in memory_rows:
+            chat = str(row.get("chat_id") or "")
+            if chat:
+                chats.add(chat)
+
+        items: list[dict[str, Any]] = []
+        for chat in chats:
+            wl = whitelist_by_chat.get(chat)
+            latest = latest_by_chat.get(chat)
+            items.append(
+                {
+                    "chat_id": chat,
+                    "label": str((wl or {}).get("label") or ""),
+                    "last_message": str((latest or {}).get("message_text") or "") if latest else "",
+                    "last_message_at": str((latest or {}).get("created_at") or "") if latest else "",
+                    "whitelisted": bool(wl),
+                }
+            )
+
+        items.sort(key=lambda x: str(x.get("last_message_at") or ""), reverse=True)
+        return items
 
     def add_memory(self, chat_id: str, content: str, *, created_by: str) -> dict[str, Any]:
-        now = self._now_iso()
-        with self._connect() as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO user_memories (chat_id, content, created_by, status, created_at, updated_at)
-                VALUES (?, ?, ?, 'active', ?, ?)
-                """,
-                (chat_id, content, created_by, now, now),
-            )
-            row = conn.execute(
-                "SELECT id, chat_id, content, created_by, status, created_at, updated_at FROM user_memories WHERE id = ?",
-                (cur.lastrowid,),
-            ).fetchone()
-        return dict(row) if row else {}
+        body = {
+            "chat_id": chat_id,
+            "content": content,
+            "created_by": created_by,
+            "status": "active",
+        }
+        resp = self._request("POST", "/user_memories", payload=body, prefer="return=representation")
+        items = self._json_list(resp)
+        return self._first_or_none(items) or {}
 
     def list_memories(self, chat_id: str, *, include_inactive: bool = False) -> list[dict[str, Any]]:
-        with self._connect() as conn:
-            if include_inactive:
-                rows = conn.execute(
-                    """
-                    SELECT id, chat_id, content, created_by, status, created_at, updated_at
-                    FROM user_memories
-                    WHERE chat_id = ?
-                    ORDER BY id DESC
-                    """,
-                    (chat_id,),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    """
-                    SELECT id, chat_id, content, created_by, status, created_at, updated_at
-                    FROM user_memories
-                    WHERE chat_id = ? AND status = 'active'
-                    ORDER BY id DESC
-                    """,
-                    (chat_id,),
-                ).fetchall()
-        return [dict(row) for row in rows]
+        params: dict[str, Any] = {
+            "select": "id,chat_id,content,created_by,status,created_at,updated_at",
+            "chat_id": f"eq.{chat_id}",
+            "order": "id.desc",
+        }
+        if not include_inactive:
+            params["status"] = "eq.active"
+
+        resp = self._request("GET", "/user_memories", params=params)
+        return self._json_list(resp)
 
     def archive_memory(self, memory_id: int) -> bool:
-        now = self._now_iso()
-        with self._connect() as conn:
-            cur = conn.execute(
-                "UPDATE user_memories SET status = 'archived', updated_at = ? WHERE id = ?",
-                (now, int(memory_id)),
-            )
-        return cur.rowcount > 0
+        body = {"status": "archived", "updated_at": self._now_iso()}
+        resp = self._request(
+            "PATCH",
+            "/user_memories",
+            params={"id": f"eq.{int(memory_id)}"},
+            payload=body,
+            prefer="return=representation",
+        )
+        return len(self._json_list(resp)) > 0
 
     def get_admin_user_by_email(self, email: str) -> dict[str, Any] | None:
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT id, email, display_name, password_hash, status, created_at, updated_at, last_login_at FROM admin_users WHERE lower(email)=lower(?)",
-                (email,),
-            ).fetchone()
-        return dict(row) if row else None
+        norm = email.strip().lower()
+        resp = self._request(
+            "GET",
+            "/admin_users",
+            params={
+                "select": "id,email,display_name,password_hash,status,created_at,updated_at,last_login_at",
+                "email": f"eq.{norm}",
+                "limit": 1,
+            },
+        )
+        return self._first_or_none(self._json_list(resp))
 
     def get_admin_user_by_id(self, user_id: int) -> dict[str, Any] | None:
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT id, email, display_name, password_hash, status, created_at, updated_at, last_login_at FROM admin_users WHERE id = ?",
-                (int(user_id),),
-            ).fetchone()
-        return dict(row) if row else None
+        resp = self._request(
+            "GET",
+            "/admin_users",
+            params={
+                "select": "id,email,display_name,password_hash,status,created_at,updated_at,last_login_at",
+                "id": f"eq.{int(user_id)}",
+                "limit": 1,
+            },
+        )
+        return self._first_or_none(self._json_list(resp))
 
     def list_admin_users(self) -> list[dict[str, Any]]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT id, email, display_name, status, created_at, updated_at, last_login_at FROM admin_users ORDER BY id DESC"
-            ).fetchall()
-        return [dict(row) for row in rows]
+        resp = self._request(
+            "GET",
+            "/admin_users",
+            params={
+                "select": "id,email,display_name,status,created_at,updated_at,last_login_at",
+                "order": "id.desc",
+            },
+        )
+        return self._json_list(resp)
 
     def upsert_admin_user(self, *, email: str, display_name: str, password_hash: str, status: str = "active") -> dict[str, Any]:
-        now = self._now_iso()
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO admin_users (email, display_name, password_hash, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(email) DO UPDATE SET
-                    display_name = excluded.display_name,
-                    password_hash = excluded.password_hash,
-                    status = excluded.status,
-                    updated_at = excluded.updated_at
-                """,
-                (email.strip().lower(), display_name.strip(), password_hash, status, now, now),
-            )
-            row = conn.execute(
-                "SELECT id, email, display_name, status, created_at, updated_at, last_login_at FROM admin_users WHERE lower(email)=lower(?)",
-                (email,),
-            ).fetchone()
-        return dict(row) if row else {}
+        body = [
+            {
+                "email": email.strip().lower(),
+                "display_name": display_name.strip(),
+                "password_hash": password_hash,
+                "status": status,
+            }
+        ]
+        resp = self._request(
+            "POST",
+            "/admin_users",
+            params={"on_conflict": "email"},
+            payload=body,
+            prefer="resolution=merge-duplicates,return=representation",
+        )
+        items = self._json_list(resp)
+        return self._first_or_none(items) or {}
 
     def touch_admin_login(self, user_id: int) -> None:
-        now = self._now_iso()
-        with self._connect() as conn:
-            conn.execute(
-                "UPDATE admin_users SET last_login_at = ?, updated_at = ? WHERE id = ?",
-                (now, now, int(user_id)),
-            )
+        body = {"last_login_at": self._now_iso(), "updated_at": self._now_iso()}
+        self._request(
+            "PATCH",
+            "/admin_users",
+            params={"id": f"eq.{int(user_id)}"},
+            payload=body,
+            prefer="return=minimal",
+        )
 
     def count_admin_users(self) -> int:
-        with self._connect() as conn:
-            row = conn.execute("SELECT COUNT(1) AS cnt FROM admin_users").fetchone()
-        return int(row["cnt"] if row else 0)
+        resp = self._request(
+            "GET",
+            "/admin_users",
+            params={"select": "id", "limit": 1},
+            prefer="count=exact",
+        )
+        content_range = resp.headers.get("content-range", "")
+        if "/" in content_range:
+            total = content_range.split("/")[-1].strip()
+            try:
+                return int(total)
+            except ValueError:
+                pass
+        return len(self._json_list(resp))
+
+    def get_user_voice(self, chat_id: str, *, default_voice: str) -> str:
+        resp = self._request(
+            "GET",
+            "/user_preferences",
+            params={"select": "voice", "chat_id": f"eq.{chat_id}", "limit": 1},
+        )
+        item = self._first_or_none(self._json_list(resp))
+        voice = str((item or {}).get("voice") or "").strip().lower()
+        return voice or default_voice
+
+    def set_user_voice(self, chat_id: str, voice: str) -> None:
+        body = [{"chat_id": chat_id, "voice": voice.lower()}]
+        self._request(
+            "POST",
+            "/user_preferences",
+            params={"on_conflict": "chat_id"},
+            payload=body,
+            prefer="resolution=merge-duplicates,return=minimal",
+        )
+
+    def get_user_language(self, chat_id: str, *, default_language: str) -> str:
+        resp = self._request(
+            "GET",
+            "/user_preferences",
+            params={"select": "language", "chat_id": f"eq.{chat_id}", "limit": 1},
+        )
+        item = self._first_or_none(self._json_list(resp))
+        language = str((item or {}).get("language") or "").strip()
+        return language or default_language
+
+    def set_user_language(self, chat_id: str, language: str) -> None:
+        body = [{"chat_id": chat_id, "language": language}]
+        self._request(
+            "POST",
+            "/user_preferences",
+            params={"on_conflict": "chat_id"},
+            payload=body,
+            prefer="resolution=merge-duplicates,return=minimal",
+        )
