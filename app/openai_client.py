@@ -17,11 +17,20 @@ class OpenAIClient:
             "Authorization": f"Bearer {self.settings.openai_api_key}",
         }
 
-    async def transcribe_audio(self, audio_bytes: bytes, filename: str, mime_type: str) -> str:
+    async def transcribe_audio(
+        self,
+        audio_bytes: bytes,
+        filename: str,
+        mime_type: str,
+        *,
+        language: str | None = None,
+    ) -> str:
         files = {
             "file": (filename, audio_bytes, mime_type),
             "model": (None, self.settings.openai_transcribe_model),
         }
+        if language:
+            files["language"] = (None, language)
         async with httpx.AsyncClient(timeout=90.0) as client:
             resp = await client.post(
                 "https://api.openai.com/v1/audio/transcriptions",
@@ -35,7 +44,11 @@ class OpenAIClient:
             raise RuntimeError(f"OpenAI transcription returned empty text: {payload}")
         return text
 
-    async def generate_reply_text(self, user_text: str) -> str:
+    async def generate_reply_text(self, user_text: str, *, reply_language_instruction: str | None = None) -> str:
+        system_prompt = self.settings.openai_system_prompt
+        if reply_language_instruction:
+            system_prompt = f"{system_prompt}\n\n{reply_language_instruction}"
+
         payload = {
             "model": self.settings.openai_response_model,
             "input": [
@@ -44,7 +57,7 @@ class OpenAIClient:
                     "content": [
                         {
                             "type": "input_text",
-                            "text": self.settings.openai_system_prompt,
+                            "text": system_prompt,
                         }
                     ],
                 },

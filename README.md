@@ -7,6 +7,7 @@
 - 用 OpenAI TTS 轉成語音
 - 回傳語音訊息到 WhatsApp
 - 支援每位用戶（chat_id）獨立語音偏好（可自行切換）
+- 支援每位用戶（chat_id）獨立主要語言偏好（降低口音誤判風險）
 
 ## 1. 專案結構
 
@@ -16,6 +17,8 @@ app/main.py
 app/config.py
 app/whatsapp.py
 app/openai_client.py
+app/voice_store.py
+app/language_store.py
 .env.example
 requirements.txt
 vercel.json
@@ -77,7 +80,10 @@ ngrok http 8000
 - `OPENAI_TTS_VOICE`（預設 `alloy`）
 - `OPENAI_TTS_FORMAT`（預設 `opus`，建議保持）
 - `OPENAI_TTS_VOICES`（可切換語音白名單，逗號分隔）
+- `OPENAI_DEFAULT_LANGUAGE`（預設 `zh-HK`）
+- `OPENAI_LANGUAGES`（可切換語言白名單，逗號分隔）
 - `VOICE_STORE_PATH`（用戶語音偏好儲存路徑）
+- `LANGUAGE_STORE_PATH`（用戶語言偏好儲存路徑）
 
 ## 6.1 用戶切換聲音指令
 
@@ -89,6 +95,22 @@ ngrok http 8000
   - `voice alloy`
 
 收到語音訊息時，bot 會使用該用戶最後設定的聲音回覆。
+
+## 6.2 用戶切換主要語言指令
+
+- 查看目前語言和可用語言：
+  - `language`
+  - `lang`
+  - `語言`
+- 切換語言（可用代碼或別名）：
+  - `language zh-HK`
+  - `language en`
+  - `語言 英文`
+  - `語言 廣東話`
+
+收到語音訊息時，bot 會：
+- 以該用戶主要語言提示 STT（減少轉錄語言誤判）
+- 強制以該用戶主要語言回覆
 
 ## 7. API 路由
 
@@ -109,6 +131,6 @@ ngrok http 8000
 
 ## 9. 注意事項
 
-- 目前只處理 `audio` 訊息，文字訊息會忽略
+- 文字訊息只處理 `voice` / `language` 指令，其他文字會忽略
 - 單請求串行處理語音；高流量建議改成 queue / worker
 - 請確認你的 WhatsApp Cloud API 帳號已開啟對應權限

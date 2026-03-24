@@ -20,11 +20,14 @@ class Settings(BaseSettings):
     openai_tts_voice: str = "alloy"
     openai_tts_format: str = "opus"
     openai_tts_voices: str = "alloy,aria,verse"
+    openai_default_language: str = "zh-HK"
+    openai_languages: str = "zh-HK,zh-TW,zh-CN,en,ja,ko"
     openai_system_prompt: str = (
         "You are a concise and helpful WhatsApp voice assistant. "
         "Reply in Traditional Chinese unless the user explicitly uses another language."
     )
     voice_store_path: str = "/tmp/voice_preferences.json"
+    language_store_path: str = "/tmp/language_preferences.json"
 
     max_reply_chars: int = 800
 

@@ -13,6 +13,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
 from app.config import get_settings
+from app.language_store import LanguagePreferenceStore
 from app.openai_client import OpenAIClient
 from app.voice_store import VoicePreferenceStore
 from app.whatsapp import WhatsAppClient, extract_inbound_messages
@@ -24,6 +25,7 @@ settings = get_settings()
 whatsapp = WhatsAppClient(settings)
 openai = OpenAIClient(settings)
 voice_store = VoicePreferenceStore(settings)
+language_store = LanguagePreferenceStore(settings)
 
 app = FastAPI(title="WhatsApp OpenAI Voice Bot", version="0.1.0")
 
@@ -109,6 +111,10 @@ async def healthz() -> dict[str, Any]:
             "default_voice": settings.openai_tts_voice,
             "available_voices": _allowed_voices(),
         },
+        "language": {
+            "default_language": settings.openai_default_language,
+            "available_languages": _allowed_languages(),
+        },
     }
 
 
@@ -189,15 +195,22 @@ async def _handle_audio_message(item: dict[str, str]) -> None:
 
     audio_bytes, downloaded_mime = await whatsapp.download_media_bytes(download_url)
     input_mime = downloaded_mime or inbound_mime
+    selected_language = await language_store.get_language(chat_id)
+    transcribe_language = _transcribe_language_code(selected_language)
 
     transcript = await openai.transcribe_audio(
         audio_bytes=audio_bytes,
         filename="user_audio.ogg",
         mime_type=input_mime,
+        language=transcribe_language,
     )
     logger.info("Transcribed from %s: %s", chat_id, transcript)
 
-    reply_text = await openai.generate_reply_text(transcript)
+    reply_instruction = _reply_language_instruction(selected_language)
+    reply_text = await openai.generate_reply_text(
+        transcript,
+        reply_language_instruction=reply_instruction,
+    )
     selected_voice = await voice_store.get_voice(chat_id)
     tts_bytes, tts_filename, tts_mime = await openai.synthesize_speech(reply_text, voice=selected_voice)
 
@@ -222,12 +235,19 @@ async def _safe_send_error(chat_id: str) -> None:
 async def _handle_text_message(item: dict[str, str]) -> bool:
     chat_id = item["chat_id"]
     text = item.get("text", "").strip()
-    command = _parse_voice_command(text)
-    if command is None:
-        return False
+    voice_command = _parse_voice_command(text)
+    if voice_command is not None:
+        return await _handle_voice_command(chat_id, voice_command)
 
+    language_command = _parse_language_command(text)
+    if language_command is not None:
+        return await _handle_language_command(chat_id, language_command)
+
+    return False
+
+
+async def _handle_voice_command(chat_id: str, command: dict[str, str]) -> bool:
     allowed = _allowed_voices()
-
     if command["action"] == "show":
         current = await voice_store.get_voice(chat_id)
         body = (
@@ -249,6 +269,32 @@ async def _handle_text_message(item: dict[str, str]) -> bool:
 
     await voice_store.set_voice(chat_id, target_voice)
     await whatsapp.send_text_message(chat_id, f"已切換語音到 {target_voice}。")
+    return True
+
+
+async def _handle_language_command(chat_id: str, command: dict[str, str]) -> bool:
+    allowed = _allowed_languages()
+    if command["action"] == "show":
+        current = await language_store.get_language(chat_id)
+        body = (
+            f"目前主要語言: {current}\n"
+            f"可用語言: {', '.join(allowed)}\n"
+            "切換方法: language <語言代碼>\n"
+            "例子: language zh-HK 或 language en"
+        )
+        await whatsapp.send_text_message(chat_id, body)
+        return True
+
+    target_language = str(command.get("language") or "")
+    if target_language not in allowed:
+        await whatsapp.send_text_message(
+            chat_id,
+            f"未支援語言「{target_language}」。可用: {', '.join(allowed)}",
+        )
+        return True
+
+    await language_store.set_language(chat_id, target_language)
+    await whatsapp.send_text_message(chat_id, f"已設定主要語言為 {target_language}。")
     return True
 
 
@@ -282,6 +328,19 @@ def _allowed_voices() -> list[str]:
     return voices
 
 
+def _allowed_languages() -> list[str]:
+    raw = (settings.openai_languages or "").strip()
+    if not raw:
+        return [settings.openai_default_language]
+
+    langs = [v.strip() for v in raw.split(",") if v.strip()]
+    if not langs:
+        return [settings.openai_default_language]
+    if settings.openai_default_language not in langs:
+        langs.append(settings.openai_default_language)
+    return langs
+
+
 def _parse_voice_command(text: str) -> dict[str, str] | None:
     raw = text.strip()
     normalized = raw.lower()
@@ -307,6 +366,97 @@ def _parse_voice_command(text: str) -> dict[str, str] | None:
         return None
 
     return {"action": "set", "voice": match.group(1).lower()}
+
+
+def _parse_language_command(text: str) -> dict[str, str] | None:
+    raw = text.strip()
+    normalized = raw.lower()
+    if normalized in {
+        "language",
+        "lang",
+        "language list",
+        "語言",
+        "语言",
+        "語言列表",
+        "语言列表",
+    }:
+        return {"action": "show"}
+
+    match = re.fullmatch(
+        r"(?:language|lang|set\s+language|語言|语言)\s*(?::|=|\s)\s*([^\s]+)\s*",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+
+    token = match.group(1).strip()
+    resolved = _resolve_language_alias(token)
+    if not resolved:
+        return {"action": "set", "language": token}
+    return {"action": "set", "language": resolved}
+
+
+def _resolve_language_alias(token: str) -> str | None:
+    key = token.strip().lower()
+    aliases = {
+        "zh": "zh-HK",
+        "zh-hk": "zh-HK",
+        "hk": "zh-HK",
+        "cantonese": "zh-HK",
+        "廣東話": "zh-HK",
+        "广东话": "zh-HK",
+        "粵語": "zh-HK",
+        "粤语": "zh-HK",
+        "zh-tw": "zh-TW",
+        "traditional": "zh-TW",
+        "繁中": "zh-TW",
+        "繁體": "zh-TW",
+        "繁体": "zh-TW",
+        "zh-cn": "zh-CN",
+        "simplified": "zh-CN",
+        "簡中": "zh-CN",
+        "简中": "zh-CN",
+        "簡體": "zh-CN",
+        "简体": "zh-CN",
+        "en": "en",
+        "english": "en",
+        "英文": "en",
+        "ja": "ja",
+        "japanese": "ja",
+        "日文": "ja",
+        "日本語": "ja",
+        "ko": "ko",
+        "korean": "ko",
+        "韓文": "ko",
+        "韩文": "ko",
+    }
+    return aliases.get(key)
+
+
+def _transcribe_language_code(language: str) -> str:
+    key = language.strip().lower()
+    if key.startswith("zh"):
+        return "zh"
+    if key.startswith("en"):
+        return "en"
+    if key.startswith("ja"):
+        return "ja"
+    if key.startswith("ko"):
+        return "ko"
+    return "zh"
+
+
+def _reply_language_instruction(language: str) -> str:
+    mapping = {
+        "zh-HK": "Always reply in Traditional Chinese with Hong Kong wording and Cantonese-friendly style.",
+        "zh-TW": "Always reply in Traditional Chinese used in Taiwan.",
+        "zh-CN": "Always reply in Simplified Chinese used in Mainland China.",
+        "en": "Always reply in English.",
+        "ja": "Always reply in Japanese.",
+        "ko": "Always reply in Korean.",
+    }
+    return mapping.get(language, "Always reply in Traditional Chinese.")
 
 
 def _render_legal_page(title: str, body_html: str) -> str:
